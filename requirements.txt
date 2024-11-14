@@ -1,0 +1,7 @@
+requests
+pandas
+google-cloud-storage
+pytubefix
+youtube-search
+beautifulsoup4
+argparse
