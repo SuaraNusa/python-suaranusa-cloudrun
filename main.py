@@ -1,105 +1,84 @@
-import requests
-import csv
-import pandas as pd
-import re
 import os
+import re
+import csv
+import subprocess
+import argparse
+from datetime import datetime
 
+import requests
+import pandas as pd
+import numpy as np
+import librosa
 from google.cloud import storage
-from pytubefix import YouTube
 from youtube_search import YoutubeSearch
 from bs4 import BeautifulSoup
+from pydub import AudioSegment
+from pytubefix import YouTube
 
-import argparse
-
-"""
-    TYPE 
-    - local: save data on local
-    - gcs: save data on Google Cloud Storage
-"""
+# Constants
+BASE_URL = 'https://www.zonareferensi.com/lagu-daerah-indonesia/'
+DEFAULT_BUCKET_NAME = 'lagu-daerah'
+DEFAULT_STORAGE_TYPE = 'local'
+MAX_VIDEO_DURATION = 300
+SEGMENT_DURATION = 30
 
 argparser = argparse.ArgumentParser()
-argparser.add_argument('--type', help='Type of storage', default='local')
-argparser.add_argument('--bucket', help='Bucket name', default='lagu-daerah')
-
+argparser.add_argument('--type', help='Type of storage', default=DEFAULT_STORAGE_TYPE)
+argparser.add_argument('--bucket', help='Bucket name', default=DEFAULT_BUCKET_NAME)
 args = argparser.parse_args()
 
-BASE_URL = 'https://www.zonareferensi.com/lagu-daerah-indonesia/'
 BUCKET_NAME = args.bucket
 TYPE = args.type
 
 def main():
-    dir_check('datasets/songs')
-    dir_check('data')
+    setup_directories(['datasets/songs', 'data'])
     
-    data = None
-    if os.path.exists('data/lagu_daerah.csv'):
-        data = pd.read_csv('data/lagu_daerah.csv')
-    else:
-        data = get_song_list()
-        
-    dl_res = []
-    for index, row in data[:5].iterrows():
-        print(f"Searching for {row['Nama Lagu']}...")
-        keyword = f"{row['Nama Lagu']} {row['Asal Daerah']}"
-        searched_songs = search_youtube(keyword)
+    data = load_song_data()
+    download_results = download_songs(data.sample(n=5))
     
+    results_df = pd.DataFrame(download_results)
+    results_df.to_csv('data/results.csv', index=False)
+    
+    results_df['wav_path'] = results_df['path'].apply(convert_to_wav)
+    results_df.to_csv('data/results_wav.csv', index=False)
+    
+    results_df['sample_rate'], results_df['duration'] = zip(*results_df['wav_path'].map(get_duration))
+    
+    segments_df = split_songs_to_segments(results_df)
+    segments_df['mfcc'] = segments_df['30s_path'].map(extract_mfcc_features)
+    segments_df.to_csv('data/30s_segments.csv', index=False)
 
-    for song in searched_songs:
-        if float(song['duration']) <= 5:
-            path = download_video(song['url'])
-            
-            dl_res.append({
-                'title': song['title'],
-                'region': row['Asal Daerah'],
-                'keyword': f"{row['Nama Lagu']},{row['Asal Daerah']}",
-                'duration': float(song['duration']),
-                'url': song['url'],
-                'path': path
-            })
+    print('Extracted MFCC features for all 30s segments')
+    print('Continue to training...')
+
+def setup_directories(paths):
+    for path in paths:
+        if TYPE == 'gcs':
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(BUCKET_NAME)
+            blob = bucket.blob(path)
+            if not blob.exists():
+                blob.upload_from_string('')
         else:
-            print(f"Duration of {song['title']} is too long")
-            
-    df = pd.DataFrame(dl_res)
-    df.to_csv('data/results.csv', index=False)
-        
-    
-    
-def dir_check(path):
-    if TYPE == 'gcs':
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(path)
-        
-        if not blob.exists():
-            blob.upload_from_string('')
+            os.makedirs(path, exist_ok=True)
+
+def load_song_data():
+    if os.path.exists('data/lagu_daerah.csv'):
+        return pd.read_csv('data/lagu_daerah.csv')
     else:
-        if not os.path.exists(path):
-            os.makedirs(path)
+        return get_song_list()
 
 def get_song_list():
     response = requests.get(BASE_URL)
     soup = BeautifulSoup(response.text, 'html.parser')
-    
     table = soup.find_all('table')[0]
     rows = table.find_all('tr')
     
-    data = []
+    data = [[ele.text.strip().replace(' ', '_') for ele in row.find_all('td')] for row in rows]
     
-    for row in rows:
-        cols = row.find_all('td')
-        
-        if len(cols) == 1:
-            cols = [ele.text.strip() for ele in cols]
-            cols = [ele.replace(' ', '_') for ele in cols]
-            data.append([ele for ele in cols if ele])
-            continue
-        
-        cols = [ele.text.strip() for ele in cols]
-        data.append([ele for ele in cols if ele])
-        
     if TYPE == 'gcs':
         storage_client = storage.Client()
-        bucket = storage_client.bucket('lagu-daerah')
+        bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob('lagu_daerah.csv')
         blob.upload_from_string(data)
     else:
@@ -107,38 +86,121 @@ def get_song_list():
             writer = csv.writer(f)
             writer.writerows(data)
         
-    return data
+    return pd.DataFrame(data)
 
 def search_youtube(query):
     search_results = YoutubeSearch(query, max_results=5).to_dict()
-    
-    for i in range(len(search_results)):
-        search_results[i]['url'] = 'https://www.youtube.com' + search_results[i]['url_suffix']
-    
+    for result in search_results:
+        result['url'] = 'https://www.youtube.com' + result['url_suffix']
     return search_results
 
 def yt_title_clean(title):
-    text = title.lower()
-    text = text.replace(' ', '_')
-    text = re.sub(r'[^a-z0-9_]', '', text)
-    text = re.sub(r'_{2,}', '_', text)
-    
-    return text
-    
+    text = title.lower().replace(' ', '_')
+    return re.sub(r'[^a-z0-9_]', '', re.sub(r'_{2,}', '_', text))
+
+def download_songs(data):
+    download_results = []
+    for _, row in data.iterrows():
+        keyword = f"{row['Nama Lagu']} {row['Asal Daerah']}"
+        searched_songs = search_youtube(keyword)
+        for song in searched_songs:
+            try:
+                duration = parse_duration(song['duration'])
+                if duration < MAX_VIDEO_DURATION:
+                    path = download_video(song['url'])
+                    if path:
+                        download_results.append({
+                            'title': song['title'],
+                            'region': row['Asal Daerah'],
+                            'keyword': f"{row['Nama Lagu']},{row['Asal Daerah']}",
+                            'duration': duration,
+                            'url': song['url'],
+                            'path': path
+                        })
+                else:
+                    print(f"Duration of {song['title']} is too long")
+            except ValueError as e:
+                print(f"Error parsing duration for {song['title']}: {e}")
+    return download_results
+
+def parse_duration(duration_str):
+    duration_str = duration_str.replace('.', ':')
+    if duration_str.count(':') == 2:
+        duration = datetime.strptime(duration_str, '%H:%M:%S')
+    else:
+        duration = datetime.strptime(duration_str, '%M:%S')
+    return duration.hour * 3600 + duration.minute * 60 + duration.second
+
 def download_video(video_id):
     try:
-        yt = YouTube(video_id, 'WEB_EMBED')
+        yt = YouTube(video_id, 'IOS')
         print(f'Downloading {yt.title}...')
-        
         title = yt_title_clean(yt.title)
         song = yt.streams.get_audio_only()
-        
+        file_path = f'datasets/songs/{title}.mp3'
+        if os.path.exists(file_path):
+            print(f'{title} already exists, skipping...')
+            return file_path
         song.download(mp3=True, output_path='datasets/songs', filename=title)
-        
-        return f'datasets/songs/{title}.mp3'
+        return file_path
     except Exception as e:
         print(f'Error: {e}')
         return None
-    
-    
-main()
+
+def convert_to_wav(path):
+    if not path:
+        print(f'File is not found: {path}')
+        return None
+    wav_path = path.replace('songs', 'wav_songs').replace('.mp3', '.wav')
+    if os.path.exists(wav_path):
+        return wav_path
+    os.makedirs('datasets/wav_songs', exist_ok=True)
+    print(f'Converting {path} to {wav_path}')
+    subprocess.run(['ffmpeg', '-i', path, wav_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return wav_path
+
+def get_duration(file_path):
+    if not file_path:
+        print('Skipping file path is None')
+        return None, None
+    y, sr = librosa.load(file_path)
+    duration = librosa.get_duration(y=y, sr=sr)
+    print(f'Sample rate: {sr}, duration: {duration}')
+    return sr, duration
+
+def split_songs_to_segments(df, output_base_folder='datasets/30s_segments'):
+    split_result = []
+    for _, row in df.iterrows():
+        wav_path = row['wav_path']
+        title = row['title']
+        region = row['region']
+        keyword = row['keyword']
+        norm_title = yt_title_clean(title)
+        norm_region = region.lower().replace(' ', '_')
+        output_dir = os.path.join(output_base_folder, norm_region, norm_title)
+        audio = AudioSegment.from_wav(wav_path)
+        total_duration = len(audio) / 1000
+        num_segments = int(total_duration // SEGMENT_DURATION)
+        os.makedirs(output_dir, exist_ok=True)
+        for i in range(num_segments):
+            start_time = i * SEGMENT_DURATION * 1000
+            end_time = (i + 1) * SEGMENT_DURATION * 1000
+            segment = audio[start_time:end_time]
+            segment_file = os.path.join(output_dir, f"{norm_title}_segment{i + 1}.wav")
+            segment.export(segment_file, format="wav")
+            split_result.append({
+                'title': title,
+                'region': region,
+                'keyword': keyword,
+                '30s_path': segment_file
+            })
+        print(f"Saved {num_segments} segments in {norm_region} for {title} at: {output_dir}")
+    return pd.DataFrame(split_result)
+
+def extract_mfcc_features(wav_path, n_mfcc=13):
+    y, sr = librosa.load(wav_path)
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    return np.mean(mfccs, axis=1)
+
+if __name__ == '__main__':
+    main()
