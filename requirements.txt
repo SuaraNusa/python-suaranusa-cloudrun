@@ -1,7 +1,7 @@
 requests
 pandas
 google-cloud-storage
-pytubefix
+pytubefix==8.3.0
 youtube-search
 beautifulsoup4
 argparse
