@@ -17,18 +17,12 @@ from pytubefix import YouTube
 
 # Constants
 BASE_URL = 'https://www.zonareferensi.com/lagu-daerah-indonesia/'
-DEFAULT_BUCKET_NAME = 'lagu-daerah'
-DEFAULT_STORAGE_TYPE = 'local'
 MAX_VIDEO_DURATION = 300
 SEGMENT_DURATION = 30
 
-argparser = argparse.ArgumentParser()
-argparser.add_argument('--type', help='Type of storage', default=DEFAULT_STORAGE_TYPE)
-argparser.add_argument('--bucket', help='Bucket name', default=DEFAULT_BUCKET_NAME)
-args = argparser.parse_args()
+BUCKET_NAME = os.getenv('BUCKET_NAME', BUCKET_NAME)
+STORAGE_TYPE = os.getenv('STORAGE_TYPE', STORAGE_TYPE)
 
-BUCKET_NAME = args.bucket
-TYPE = args.type
 
 def main():
     setup_directories(['datasets/songs', 'data'])
