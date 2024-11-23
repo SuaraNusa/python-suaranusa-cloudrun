@@ -4,4 +4,3 @@ google-cloud-storage
 pytubefix==8.3.0
 youtube-search
 beautifulsoup4
-argparse
